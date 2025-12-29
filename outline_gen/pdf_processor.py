@@ -204,6 +204,47 @@ class PDFProcessor:
 
         return "\n".join(text_parts)
 
+    def extract_text_for_page_range(
+        self,
+        start_page: int,
+        end_page: int
+    ) -> str:
+        """
+        Extract plain text from a given 1-indexed page range (inclusive).
+
+        This is similar to extract_text_with_pages, but:
+        - Uses global 1-indexed page numbers for start/end.
+        - Does not insert [Page N] markers, only concatenates page texts.
+        """
+        if start_page <= 0 and end_page <= 0:
+            return ""
+
+        page_count = len(self.doc)
+        if page_count == 0:
+            return ""
+
+        # Normalize to 0-indexed bounds within the document range.
+        start_idx = max(start_page - 1, 0)
+        end_idx = min(end_page - 1, page_count - 1)
+
+        if end_idx < start_idx:
+            return ""
+
+        text_parts = []
+        is_scanned = self.is_scanned_pdf()
+
+        for page_num in range(start_idx, end_idx + 1):
+            page = self.doc[page_num]
+
+            page_text = page.get_text().strip()
+            if not page_text and self.use_ocr and is_scanned:
+                page_text = self.extract_text_with_ocr(page_num)
+
+            if page_text:
+                text_parts.append(page_text)
+
+        return "\n\n".join(text_parts)
+
     def get_page_count(self) -> int:
         """Get total number of pages in the PDF."""
         return len(self.doc)
