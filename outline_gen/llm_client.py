@@ -7,6 +7,7 @@ from typing import List, Dict, Optional
 from openai import OpenAI
 
 from .language_utils import is_probably_english
+from .usage_tracker import record_chat_completion_usage
 
 
 class OutlineItem:
@@ -104,6 +105,9 @@ class LLMClient:
                     if attempt == 2:
                         raise RuntimeError(f"Failed to generate outline: {str(e)}")
                     continue
+
+                # Record token usage for this call, if available
+                record_chat_completion_usage(self.model, response)
 
                 outline_text = response.choices[0].message.content or ""
 

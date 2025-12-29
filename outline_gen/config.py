@@ -6,6 +6,27 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 
+# Default configuration values used when creating a new config file
+# and as a fallback when specific fields are missing from the YAML.
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "dashscope_api_key": "your-api-key-here",
+    "model": "qwen-turbo",
+    "default_depth": 2,
+    "output_format": "txt",
+    "data_root": "data",
+    # Placeholder pricing; you can edit values here to change
+    # default prices, even if YAML does not specify them.
+    "pricing": {
+        # 示例：请根据实际模型价格修改
+        "qwen-turbo": {
+            "input_per_1k": 0.0003,
+            "output_per_1k": 0.0006,
+            "currency": "CNY",
+        }
+    },
+}
+
+
 class Config:
     """Manages configuration from environment variables and config files."""
 
@@ -47,18 +68,50 @@ class Config:
         """Get default output format from config."""
         return self._config_data.get("output_format", "txt")
 
+    def get_data_root(self) -> Path:
+        """Get default data root directory for PDF + outline + rewritten docs."""
+        root = self._config_data.get("data_root")
+        if root:
+            return Path(root)
+        return Path("data")
+
+    def get_pricing(self) -> Dict[str, Any]:
+        """Get model pricing configuration.
+
+        Expected structure in config.yaml (example placeholder):
+        pricing:
+          qwen-turbo:
+            input_per_1k: 0.0000  # 每 1k 输入 token 价格
+            output_per_1k: 0.0000 # 每 1k 输出 token 价格
+            currency: "CNY"
+        """
+        # Start from code-level defaults so editing DEFAULT_CONFIG["pricing"]
+        # in config.py can take effect even without YAML changes.
+        base_pricing = dict(DEFAULT_CONFIG.get("pricing") or {})
+
+        pricing = self._config_data.get("pricing")
+        if isinstance(pricing, dict):
+            # Shallow-merge YAML pricing into defaults (per-model, per-field)
+            for model, cfg in pricing.items():
+                if not isinstance(cfg, dict):
+                    # If YAML entry is not a dict, override completely
+                    base_pricing[model] = cfg
+                    continue
+                merged = dict(base_pricing.get(model, {}))
+                merged.update(cfg)
+                base_pricing[model] = merged
+
+        return base_pricing
+
+    def get_model_pricing(self, model: str) -> Dict[str, Any]:
+        """Get pricing config for a specific model."""
+        return self.get_pricing().get(model, {})
+
     def create_default_config(self):
         """Create default config file."""
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
-        default_config = {
-            "dashscope_api_key": "your-api-key-here",
-            "model": "qwen-turbo",
-            "default_depth": 2,
-            "output_format": "txt"
-        }
-
         with open(self.config_file, 'w', encoding='utf-8') as f:
-            yaml.dump(default_config, f, allow_unicode=True)
+            yaml.dump(DEFAULT_CONFIG, f, allow_unicode=True)
 
         return self.config_file

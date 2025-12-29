@@ -23,6 +23,7 @@ from rich.panel import Panel
 
 from .config import Config
 from .pdf_processor import PDFProcessor
+from .usage_tracker import record_chat_completion_usage
 
 
 @dataclass
@@ -36,86 +37,6 @@ class OutlineEntry:
     parent: Optional["OutlineEntry"] = None
 
 
-BOOK_TYPE_CONFIG: Dict[str, Dict[str, str]] = {
-    "novel": {
-        "label": "小说",
-        "expectation": "张力与沉浸",
-        "skeleton": "目标-阻碍-选择-结果-钩子",
-    },
-    "narrative_nonfiction": {
-        "label": "纪实叙事",
-        "expectation": "真实与解释",
-        "skeleton": "场景-问题-证据-解释-意义",
-    },
-    "history": {
-        "label": "历史",
-        "expectation": "因果与脉络",
-        "skeleton": "背景-事件-机制-影响-争议",
-    },
-    "philosophy": {
-        "label": "哲学/思辨",
-        "expectation": "概念澄清",
-        "skeleton": "问题-论证-反驳-回应",
-    },
-    "argument": {
-        "label": "议论文/观点",
-        "expectation": "说服与判断",
-        "skeleton": "主张-证据-反方-权衡",
-    },
-    "biography": {
-        "label": "传记/回忆录",
-        "expectation": "人与命运",
-        "skeleton": "阶段-转折-关系-代价",
-    },
-    "self_help": {
-        "label": "自助/成长",
-        "expectation": "可持续改变",
-        "skeleton": "困境-观念-练习-复盘-失败",
-    },
-    "business_case": {
-        "label": "商业案例",
-        "expectation": "可迁移经验",
-        "skeleton": "情境-决策-取舍-复盘",
-    },
-    "poetry": {
-        "label": "诗歌/散文",
-        "expectation": "余韵与多义",
-        "skeleton": "意象-转折-语言-留白",
-    },
-}
-
-BOOK_TYPE_ALIASES: Dict[str, str] = {
-    "novel": "novel",
-    "小说": "novel",
-    "story": "novel",
-    "fiction": "novel",
-    "narrative_nonfiction": "narrative_nonfiction",
-    "纪实叙事": "narrative_nonfiction",
-    "nonfiction": "narrative_nonfiction",
-    "history": "history",
-    "历史": "history",
-    "philosophy": "philosophy",
-    "哲学": "philosophy",
-    "思辨": "philosophy",
-    "argument": "argument",
-    "议论文": "argument",
-    "观点": "argument",
-    "biography": "biography",
-    "传记": "biography",
-    "回忆录": "biography",
-    "memoir": "biography",
-    "self_help": "self_help",
-    "自助": "self_help",
-    "成长": "self_help",
-    "business_case": "business_case",
-    "商业案例": "business_case",
-    "case": "business_case",
-    "poetry": "poetry",
-    "散文": "poetry",
-    "诗歌": "poetry",
-}
-
-
 console = Console()
 
 
@@ -127,7 +48,6 @@ class BookRewriter:
         pdf_path: str,
         outline_txt_path: str,
         output_root: str,
-        book_type: str,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
     ):
@@ -140,28 +60,18 @@ class BookRewriter:
         if not self.outline_txt_path.exists():
             raise FileNotFoundError(f"Outline TXT not found: {self.outline_txt_path}")
 
-        self.book_type_key = self._normalize_book_type(book_type)
-        self.book_type_config = BOOK_TYPE_CONFIG[self.book_type_key]
-
         cfg = Config()
-        api_key = api_key or cfg.get_api_key()
-        if not api_key:
+        self.api_key = api_key or cfg.get_api_key()
+        if not self.api_key:
             raise ValueError("DASHSCOPE_API_KEY not found in environment or config")
 
         self.model = model or cfg.get_model()
         self.client = OpenAI(
-            api_key=api_key,
+            api_key=self.api_key,
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         )
-
-    def _normalize_book_type(self, book_type: str) -> str:
-        key = book_type.strip().lower()
-        if key in BOOK_TYPE_ALIASES:
-            return BOOK_TYPE_ALIASES[key]
-        # Try raw key if it matches directly
-        if key in BOOK_TYPE_CONFIG:
-            return key
-        raise ValueError(f"Unsupported book type: {book_type}")
+        # Filled by _analyze_book_style() before rewriting leaves.
+        self.book_style_analysis: Optional[str] = None
 
     def _parse_outline(self) -> List[OutlineEntry]:
         """Parse outline TXT into a tree of OutlineEntry objects."""
@@ -221,6 +131,14 @@ class BookRewriter:
         leaves.sort(key=lambda e: (e.page, e.level))
         return leaves
 
+    def _read_outline_text(self, max_chars: int = 20000) -> str:
+        """Read the full outline text (optionally truncated)."""
+        with open(self.outline_txt_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        if len(text) > max_chars:
+            return text[:max_chars]
+        return text
+
     def _build_leaf_page_ranges(
         self,
         leaves: List[OutlineEntry],
@@ -252,6 +170,72 @@ class BookRewriter:
         if len(text) <= max_chars:
             return text
         return text[:max_chars]
+
+    def _analyze_book_style(self) -> str:
+        """
+        Use LLM once on the existing outline to infer:
+        - the broad type/style of the book,
+        - typical reader expectations,
+        - and high-level suggestions for how each leaf section should be
+          summarized into short Chinese paragraphs.
+
+        The result is stored as self.book_style_analysis and reused by all
+        subsequent leaf-level rewrite calls.
+        """
+        outline_preview = self._read_outline_text()
+
+        prompt = (
+            "下面是一整本书的层级大纲片段（可能略有截断），包含章节标题和对应页码。\n"
+            "请你站在一名资深中文图书编辑的视角，对这本书做一个精炼的类型与写法分析，"
+            "并给出如何为每个小节生成“精简版中文正文”的总结策略。\n\n"
+            "请用简体中文，控制在约 300 字以内，回答内容包含以下三部分：\n"
+            "1. 用 1–2 句话判断这本书大致属于哪类书（可以自由描述，不要拘泥于单一标签，例如“宏观经济数据解读型研究书”“带案例的商业分析书”等），以及典型读者的主要期待是什么。\n"
+            "2. 用 2–4 句话说明你认为在重写每个小节时，应该优先保留哪些信息、可以删掉哪些信息（例如“保留关键因果链条和数字量级，删去次要例子和过度铺陈”）。\n"
+            "3. 用 3–5 个短句（非列表，只用自然语言连续写出）描述一个你推荐的“隐含组织骨架”，"
+            "例如“先交代背景，再说明核心问题，然后给出关键证据与机制，最后落在结论与启示上”等。\n\n"
+            "回答要求：\n"
+            "- 不要使用项目符号或编号列表，只用自然段连续书写。\n"
+            "- 不要输出任何标题、小标题或分隔符。\n"
+            "- 不要复述完整大纲，只做概括性分析和建议。\n\n"
+            "以下是大纲片段：\n"
+            "---------------- 大纲开始 ----------------\n"
+            f"{outline_preview}\n"
+            "---------------- 大纲结束 ----------------\n"
+        )
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一名经验丰富的中文图书编辑，擅长分析一本书的整体结构、类型和读者期待，"
+                        "并给出适合作为“精简版正文”的重写策略。你总是用简体中文回答。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0.3,
+        )
+
+        # Record usage for analysis call
+        record_chat_completion_usage(self.model, response)
+
+        analysis = (response.choices[0].message.content or "").strip()
+        self.book_style_analysis = analysis
+
+        console.print(
+            Panel(
+                analysis or "[空分析结果]",
+                title="[bold magenta]书籍类型与总结策略分析[/bold magenta]",
+                border_style="magenta",
+            )
+        )
+
+        return analysis
 
     def _postprocess_markdown(self, text: str) -> str:
         """
@@ -311,19 +295,16 @@ class BookRewriter:
 
         raw_text = self._truncate_text(raw_text)
 
-        cfg = self.book_type_config
-        label = cfg["label"]
-        expectation = cfg["expectation"]
-        skeleton = cfg["skeleton"]
+        style = self.book_style_analysis or ""
 
         prompt = (
             "你将看到一本书中某个小节的原文片段（可能跨越若干页）。\n"
             "请基于这段原文，用流畅自然的简体中文重写一个“精简版正文”。\n\n"
-            f"书籍类型：{label}\n"
-            f"读者主要期待：{expectation}\n"
-            f"推荐的隐含组织骨架关键词：{skeleton}\n\n"
-            "请在内部构思时，可以参考上述骨架关键词的顺序来组织材料，"
-            "但不要在文本中显式写出这些词语或任何结构标签。\n\n"
+            "在开始重写之前，请先参考下面这段基于全书大纲的整体分析与建议：\n"
+            "（由另一轮大模型分析得到，用于帮助你自动判断书籍类型、读者期待，以及适合的总结方式）\n"
+            "---------------- 分析与建议开始 ----------------\n"
+            f"{style}\n"
+            "---------------- 分析与建议结束 ----------------\n\n"
             "输出严格遵守以下要求：\n"
             "1. 只输出正文内容，不要输出任何标题、小标题或分隔符。\n"
             "2. 不要使用任何 Markdown 标记或列表：禁止以 #、*、-、+、数字加点 等形式开头的行，"
@@ -356,6 +337,9 @@ class BookRewriter:
             ],
             temperature=0.5,
         )
+
+        # Record usage for this leaf rewrite call
+        record_chat_completion_usage(self.model, response)
 
         content = response.choices[0].message.content or ""
         return self._postprocess_markdown(content)
@@ -448,6 +432,10 @@ class BookRewriter:
         leaves = self._collect_leaf_entries(roots)
         if not leaves:
             raise ValueError("Outline TXT does not contain any leaf entries.")
+
+        # Analyze book type & summarization strategy once based on the full outline.
+        console.print("[bold magenta]正在分析全书大纲，以自动判断书籍类型和总结策略...[/bold magenta]")
+        self._analyze_book_style()
 
         # Prepare MkDocs output structure
         self.output_root.mkdir(parents=True, exist_ok=True)
