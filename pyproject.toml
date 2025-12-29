@@ -1,0 +1,20 @@
+[project]
+name = "outline-gen"
+version = "0.1.0"
+description = "A CLI tool for recursively generating detailed outlines for PDF books"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf>=1.23.0",
+    "openai>=1.0.0",
+    "click>=8.0.0",
+    "pyyaml>=6.0.0",
+    "rich>=13.0.0",
+    "pytesseract>=0.3.10",
+    "pillow>=10.0.0",
+]
+
+[project.scripts]
+outline-gen = "outline_gen.cli:main"
+
+[tool.uv]
+package = true
