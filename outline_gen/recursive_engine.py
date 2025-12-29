@@ -34,10 +34,22 @@ class OutlineNode:
 
     def flatten(self, prefix: str = "") -> List[str]:
         """Flatten outline to list of formatted strings."""
-        # 使用制表符代表层级缩进，而不是空格
-        indent_level = max(self.level - 1, 0)
-        indent = "\t" * indent_level
-        lines = [f"{indent}{self.title} {self.page}"]
+        # 使用制表符代表层级缩进，而不是空格；
+        # level=0 视为顶层，level>=1 的节点都会缩进。
+        indent = "\t" * max(self.level, 0)
+
+        # 书签标题有时会包含换行符（例如目录行被读成两行），
+        # 这里将其拆成多行输出，并为后续行保留相同缩进。
+        title_lines = self.title.splitlines() or [self.title]
+        lines: List[str] = []
+
+        # 第一行带页码
+        first = title_lines[0]
+        lines.append(f"{indent}{first} {self.page}")
+
+        # 其余行只展示标题内容，不重复页码
+        for extra in title_lines[1:]:
+            lines.append(f"{indent}{extra}")
 
         for child in self.children:
             lines.extend(child.flatten(prefix))

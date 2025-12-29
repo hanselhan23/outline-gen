@@ -6,6 +6,8 @@ import re
 from typing import List, Dict, Optional
 from openai import OpenAI
 
+from .language_utils import is_probably_english
+
 
 class OutlineItem:
     """Represents a single outline item with title and page number."""
@@ -74,27 +76,47 @@ class LLMClient:
                 total_chunks=len(chunks),
             )
 
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "你是一个专业的图书大纲生成助手。你需要分析文本内容，生成结构化的章节大纲，并标注每个章节的起始页码。",
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        },
-                    ],
-                    temperature=0.3,
-                )
-            except Exception as e:
-                raise RuntimeError(f"Failed to generate outline: {str(e)}")
+            # Try multiple times for each chunk: if the first responses are
+            # judged to be mostly English, automatically retry a few times.
+            for attempt in range(3):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "你是一个专业的图书大纲生成助手。"
+                                    "你的任务是分析图书内容，生成结构化的中文章节大纲，并标注每个章节的起始页码。"
+                                    "无论原始文本是中文还是其他语言，你输出的所有标题和说明文字都必须使用简体中文。"
+                                    "除少量国际通用缩写（例如 GDP、FDI、PMI 等）外，请不要保留英文单词、短语或章节名"
+                                    "（例如 Introduction、Section、Chapter 等），而是改写为自然流畅的中文表达。"
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": prompt,
+                            },
+                        ],
+                        temperature=0.5,
+                    )
+                except Exception as e:
+                    if attempt == 2:
+                        raise RuntimeError(f"Failed to generate outline: {str(e)}")
+                    continue
 
-            outline_text = response.choices[0].message.content or ""
-            items = self._parse_outline(outline_text)
-            all_items.extend(items)
+                outline_text = response.choices[0].message.content or ""
+
+                # Validate that the model respected the "Chinese only" requirement.
+                # If the outline appears to be mostly English on early attempts,
+                # automatically retry. If it remains English after all attempts,
+                # still accept the last result instead of raising an error.
+                if is_probably_english(outline_text) and attempt < 2:
+                    continue
+
+                items = self._parse_outline(outline_text)
+                all_items.extend(items)
+                break
 
         # 合并后按页码排序，避免块之间顺序错乱
         all_items.sort(key=lambda item: item.page)
@@ -162,18 +184,9 @@ class LLMClient:
 
         prompt = (
             "你现在拿到的是一段已经按书签拆分好的图书内容片段，文本中包含页码标记 [Page N]。\n"
-            "请仔细阅读并理解这段内容，为它生成一个“精炼的大纲”，而不是简单抄录原文中的标题。\n\n"
+            "请仔细阅读并理解这段内容，为它生成一个“精炼的中文大纲”，而不是简单抄录原文中的标题。\n\n"
             "请特别注意以下高优先级规则（从高到低）：\n"
-            "1. 如果你判断当前文本主要是图书的“目录/Contents”页，或者类似下面这种几乎全部是“标题 + 页码”的结构（缺少完整段落和句子）：\n"
-            "   - 第11章 哪里有预测，哪里就有客观无知 169\n"
-            "   -   客观无知的普遍性 169\n"
-            "   -     预测中的自信与现实的差距 170\n"
-            "   -     决策者对直觉的依赖与误区 172\n"
-            "   -     模型与人类判断的有限优势 174\n"
-            "   -     否认无知的心理机制与影响 176\n"
-            "   - 第12章 常态谷：事情虽无法预测，但可以被理解 179\n"
-            "   -   社会科学研究的预测局限性 179\n"
-            "   -     单一事件预测的低准确性 180\n"
+            "1. 如果你判断当前文本主要是图书的“目录/Contents”页，或者几乎全部是“标题 + 页码”的结构（缺少完整段落和句子）：\n"
             "   那么请不要生成任何新的大纲条目，直接返回一个空字符串（什么也不要输出）。这一条规则优先级最高。\n"
             "2. 所有大纲条目必须是单层结构，禁止生成子级条目；每一行都是同一层级的条目，行首不能有任何缩进空格。\n"
             "3. 每个条目必须包含起始页码信息。\n\n"
@@ -191,7 +204,10 @@ class LLMClient:
             "待分析的文本内容如下：\n"
             f"{chunk_text}\n\n"
             "如果你判断这是目录/Contents 页，请直接返回一个空字符串；\n"
-            "否则，请按照上述要求，输出 3–5 个条目的大纲："
+            "否则，请按照上述要求，输出 3–5 个条目的大纲。\n"
+            "特别注意：无论原文是否为英文，你输出的条目标题和说明必须全部使用中文，"
+            "不要保留英文章节标题（如 Introduction、Section I 等），"
+            "可以保留极少量必要的英文缩写（如 GDP/FDI/PMI）。\n"
         )
 
         return prompt
