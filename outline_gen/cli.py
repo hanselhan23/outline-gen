@@ -1,434 +1,331 @@
-"""Command-line interface for outline-gen."""
+"""Workspace-based CLI for outline-gen."""
+
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from typing import List, Optional
 
 import click
-import sys
-from pathlib import Path
-
 from rich.console import Console
 from rich.panel import Panel
-from rich.tree import Tree
 
 from .config import Config
-from .recursive_engine import RecursiveEngine, OutlineNode
+from .llm_client import LLMClient
 from .pdf_processor import PDFProcessor
-from .book_rewriter import BookRewriter
-from .usage_tracker import global_usage_tracker
+from .workspace import (
+    OutlineNode,
+    Workspace,
+    build_nodes_from_bookmarks,
+    compute_subtree_stats,
+    find_node,
+    find_parent_and_index,
+    load_workspace,
+    recompute_ranges,
+    save_workspace,
+)
 
 
 console = Console()
 
 
-def _generate_outline_for_pdf(
-    pdf_path: Path,
-    depth: int,
-    output: Path,
-    fmt: str,
-    model: str,
-    api_key: str,
-) -> None:
-    """Core routine to generate outline for a single PDF."""
-    # Display configuration
-    console.print(Panel.fit(
-        f"[bold]PDF文件:[/bold] {pdf_path}\n"
-        f"[bold]递归层级:[/bold] {depth}\n"
-        f"[bold]输出文件:[/bold] {output}\n"
-        f"[bold]输出格式:[/bold] {fmt}\n"
-        f"[bold]使用模型:[/bold] {model}",
-        title="配置信息",
-        border_style="blue"
-    ))
+def _resolve_data_root(data_root: Optional[str]) -> Path:
+    if data_root:
+        return Path(data_root)
+    return Config().get_data_root()
 
-    # Verify PDF has bookmarks
+
+def _copy_pdf_to_workspace(src: Path, dest: Path, force: bool) -> None:
+    if dest.exists():
+        if not force:
+            raise FileExistsError(f"PDF already exists: {dest}")
+        dest.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+
+
+def _load_workspace_or_exit(book_id: str, data_root: Path) -> Workspace:
     try:
-        with PDFProcessor(pdf_path) as processor:
-            bookmarks = processor.extract_bookmarks()
-            page_count = processor.get_page_count()
-            is_scanned = processor.is_scanned_pdf()
-
-            console.print(f"\n[blue]ℹ[/blue] PDF信息:")
-            console.print(f"  页数: {page_count}")
-            console.print(f"  书签数: {len(bookmarks)}")
-            console.print(f"  PDF类型: {'扫描版 (需要OCR)' if is_scanned else '文本版'}")
-
-            if bookmarks:
-                console.print(f"  最小层级: {min(b.level for b in bookmarks)}")
-                console.print(f"  最大层级: {max(b.level for b in bookmarks)}")
-
-            # Check if tesseract is available for scanned PDFs
-            if is_scanned:
-                try:
-                    import pytesseract
-                    pytesseract.get_tesseract_version()
-                    console.print("[green]  ✓ Tesseract OCR 已安装[/green]")
-                except Exception:
-                    console.print("[yellow]  ⚠ 警告: Tesseract OCR 未安装，无法处理扫描版 PDF[/yellow]")
-                    console.print("[yellow]    请安装: sudo apt-get install tesseract-ocr tesseract-ocr-chi-sim[/yellow]")
-                    sys.exit(1)
-
-    except Exception as e:
-        console.print(f"[red]错误：[/red] 无法读取PDF文件: {e}", style="bold red")
-        sys.exit(1)
-
-    # Initialize engine
-    console.print("\n[bold green]开始生成大纲...[/bold green]\n")
-
-    try:
-        engine = RecursiveEngine(
-            pdf_path=str(pdf_path),
-            max_depth=depth,
-            api_key=api_key
-        )
-
-        # Hierarchical real-time progress logging (no Live, pure scroll output)
-        def progress_callback(action: str, node: OutlineNode):
-            """Handle progress updates with hierarchical, readable logging."""
-            level = max(node.level, 0)
-            indent = "  " * level
-            level_tag = f"[cyan]层级 {level}[/cyan]"
-            # Page range used for this level's outline generation
-            if getattr(node, "start_page", None) and getattr(node, "end_page", None):
-                if node.start_page == node.end_page:
-                    range_info = f"第{node.start_page}页"
-                else:
-                    range_info = f"第{node.start_page}–{node.end_page}页"
-            else:
-                range_info = f"第{node.page}页"
-
-            if action == "generating":
-                # Extra spacing between顶层章节 for更清晰
-                if level == 0:
-                    console.print()
-                console.print(
-                    f"{level_tag} [yellow]⏳ 正在生成[/yellow] "
-                    f"{indent}[bold]{node.title}[/bold] "
-                    f"[dim](基于 {range_info})[/dim]"
-                )
-            elif action == "generated":
-                console.print(
-                    f"{level_tag} [green]✓ 已完成[/green] "
-                    f"{indent}[bold]{node.title}[/bold] "
-                    f"[dim](基于 {range_info})[/dim]"
-                )
-                if node.children:
-                    child_indent = "  " * (level + 1)
-                    total = len(node.children)
-                    for idx, child in enumerate(node.children):
-                        branch = "└─" if idx == total - 1 else "├─"
-                        console.print(
-                            f"{child_indent}{branch} [bold]{child.title}[/bold] "
-                            f"[dim](第{child.page}页, 层级 {child.level})[/dim]"
-                        )
-
-                # After each节点完成, 输出当前树状大纲快照，方便实时查看整体结构
-                if engine.outline_tree:
-                    snapshot_tree = Tree("📚 当前大纲进度")
-
-                    def add_nodes_to_snapshot(parent_tree, nodes):
-                        for n in nodes:
-                            label = f"{n.title} [dim](第{n.page}页)[/dim]"
-                            branch = parent_tree.add(label)
-                            if n.children:
-                                add_nodes_to_snapshot(branch, n.children)
-
-                    add_nodes_to_snapshot(snapshot_tree, engine.outline_tree)
-                    console.print("\n[dim]当前树状大纲（部分进度）：[/dim]")
-                    console.print(snapshot_tree)
-
-            elif action.startswith("error:"):
-                error_msg = action.split(":", 1)[1]
-                console.print(
-                    f"{level_tag} [red]✗ 出错[/red] "
-                    f"{indent}[bold]{node.title}[/bold] "
-                    f"[dim](基于 {range_info})[/dim]: {error_msg}"
-                )
-
-        # Generate outline with real-time progress logs
-        outline_tree = engine.generate_outline(progress_callback=progress_callback)
-
-        if not outline_tree:
-            console.print("[yellow]警告：[/yellow] 未能生成大纲", style="bold yellow")
-            sys.exit(1)
-
-        # Save outline
-        engine.save_outline(str(output), format=fmt)
-
-        # Display result
-        console.print(f"\n[bold green]✓ 大纲生成完成！[/bold green]")
-        console.print(f"输出文件: [blue]{output}[/blue]")
-
-        # Display outline preview
-        console.print("\n[bold]大纲预览:[/bold]")
-        tree = Tree("📚 " + pdf_path.name)
-
-        def add_nodes_to_tree(parent_tree, nodes):
-            for node in nodes:
-                branch = parent_tree.add(f"{node.title} [dim](第{node.page}页)[/dim]")
-                if node.children:
-                    add_nodes_to_tree(branch, node.children)
-
-        add_nodes_to_tree(tree, outline_tree)
-        console.print(tree)
-
-        # Cleanup
-        engine.cleanup()
-        console.print(f"\n[dim]已清理 {len(engine.temp_files)} 个临时文件[/dim]")
-
-    except KeyboardInterrupt:
-        console.print("\n[yellow]已取消操作[/yellow]")
-        sys.exit(130)
-    except Exception as e:
-        console.print(f"\n[bold red]错误：[/bold red] {str(e)}")
-        import traceback
-        console.print(f"[dim]{traceback.format_exc()}[/dim]")
-        sys.exit(1)
+        return load_workspace(book_id, data_root)
+    except FileNotFoundError as exc:
+        console.print(f"[red]错误：[/red] {exc}")
+        raise SystemExit(1)
 
 
-def _print_usage_summary(config: Config, title: str = "LLM 调用统计") -> None:
-    """Print a rich summary of token usage and estimated cost."""
-    summary = global_usage_tracker.summary()
-    if not summary:
-        return
+def _render_tree(nodes: List[OutlineNode]) -> List[str]:
+    stats = compute_subtree_stats(nodes)
 
-    lines = []
-    for model, usage in summary.items():
-        pricing = config.get_model_pricing(model)
-        input_rate = pricing.get("input_per_1k")
-        output_rate = pricing.get("output_per_1k")
-        currency = pricing.get("currency", "CNY")
+    lines: List[str] = []
 
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        total_tokens = usage.get("total_tokens", 0)
+    def fmt_node(node: OutlineNode) -> str:
+        info = f"pp {node.start_page}-{node.end_page}"
+        if node.children:
+            info += f", subtree {stats[node.id]['node_count']} nodes, leaves {stats[node.id]['leaf_count']}"
+        else:
+            info += f", pages {stats[node.id]['page_count']}"
+        return f"[{node.id}] {node.title} ({info})"
 
-        cost_str = "价格未配置"
-        if input_rate is not None and output_rate is not None:
-            total_cost = (prompt_tokens / 1000.0) * float(input_rate) + (
-                completion_tokens / 1000.0
-            ) * float(output_rate)
-            cost_str = f"{total_cost:.4f} {currency}"
+    def walk(node: OutlineNode, prefix: str, is_last: bool) -> None:
+        branch = "└─ " if is_last else "├─ "
+        lines.append(f"{prefix}{branch}{fmt_node(node)}")
+        child_prefix = f"{prefix}{'   ' if is_last else '│  '}"
+        for idx, child in enumerate(node.children):
+            walk(child, child_prefix, idx == len(node.children) - 1)
 
-        lines.append(
-            f"模型: {model}\n"
-            f"  输入 tokens: {prompt_tokens}\n"
-            f"  输出 tokens: {completion_tokens}\n"
-            f"  总 tokens: {total_tokens}\n"
-            f"  预估费用: {cost_str}"
-        )
+    for idx, root in enumerate(nodes):
+        walk(root, "", idx == len(nodes) - 1)
 
-    text = "\n\n".join(lines)
-    console.print(
-        Panel(
-            text,
-            title=f"[bold blue]{title}[/bold blue]",
-            border_style="blue",
-        )
-    )
+    return lines
 
 
 @click.group()
-def main():
-    """outline-gen 命令行工具。"""
-    pass
+def main() -> None:
+    """outline-gen workspace CLI."""
 
 
 @main.command("init-config")
-def init_config_cmd():
-    """创建默认配置文件 (~/.outline-gen/config.yaml)。"""
+def init_config_cmd() -> None:
+    """Create default config file (~/.outline-gen/config.yaml)."""
     config = Config()
-    config_path = config.create_default_config()
-    console.print(f"[green]✓[/green] 已创建配置文件: {config_path}")
+    path = config.create_default_config()
+    console.print(f"[green]✓[/green] 已创建配置文件: {path}")
     console.print("[yellow]请编辑配置文件并添加您的 API 密钥[/yellow]")
 
 
-@main.command("outline")
-@click.argument('pdf_path', type=click.Path(exists=True))
-@click.option(
-    '--depth', '-d',
-    type=int,
-    default=None,
-    help='递归层级深度 (默认: 配置中的 default_depth, 默认为2)'
-)
-@click.option(
-    '--output', '-o',
-    type=click.Path(),
-    default=None,
-    help='输出文件路径 (默认: 与PDF同名.outline.txt)'
-)
-@click.option(
-    '--format', '-f',
-    type=click.Choice(['txt', 'json', 'md'], case_sensitive=False),
-    default=None,
-    help='输出格式 (默认: 配置中的 output_format, 默认为 txt)'
-)
-@click.option(
-    '--model', '-m',
-    type=str,
-    default=None,
-    help='使用的模型 (默认: 配置中的 model, 默认为 qwen-turbo)'
-)
-@click.option(
-    '--api-key',
-    type=str,
-    default=None,
-    help='Dashscope API密钥 (可选，优先使用环境变量/配置文件)'
-)
-def outline_cmd(pdf_path, depth, output, format, model, api_key):
-    """为指定 PDF 生成递归大纲。"""
-    config = Config()
+@main.command("init")
+@click.argument("book_id", type=str)
+@click.option("--pdf", "pdf_path", type=click.Path(exists=True, dir_okay=False), required=True)
+@click.option("--title", type=str, default=None, help="Root node title (default: book_id).")
+@click.option("--data-root", type=click.Path(), default=None)
+@click.option("--force", is_flag=True, help="Overwrite existing workspace PDF/outline.")
+def init_cmd(book_id: str, pdf_path: str, title: Optional[str], data_root: Optional[str], force: bool) -> None:
+    """Initialize a workspace under data/<book_id> with a single root node."""
+    data_root_path = _resolve_data_root(data_root)
+    book_dir = data_root_path / book_id
+    pdf_dest = book_dir / "book.pdf"
+    outline_path = book_dir / "outline.json"
 
-    # 注意：depth=0 也应被视为有效值，因此仅在 depth 为 None 时使用默认配置
-    depth = config.get_default_depth() if depth is None else depth
-    fmt = (format or config.get_output_format()).lower()
-    api_key = api_key or config.get_api_key()
-    model = model or config.get_model()
+    try:
+        _copy_pdf_to_workspace(Path(pdf_path), pdf_dest, force=force)
+    except FileExistsError as exc:
+        console.print(f"[red]错误：[/red] {exc}")
+        console.print("使用 --force 进行覆盖。")
+        raise SystemExit(1)
 
-    if not api_key:
-        console.print("[red]错误：[/red] 未找到 Dashscope API 密钥", style="bold red")
-        console.print("\n请通过以下方式之一设置 API 密钥：")
-        console.print("1. 设置环境变量: export DASHSCOPE_API_KEY=your-key")
-        console.print("2. 运行 outline-gen init-config 创建配置文件")
-        sys.exit(1)
+    with PDFProcessor(str(pdf_dest)) as processor:
+        total_pages = processor.get_page_count()
+        bookmarks = processor.extract_bookmarks()
 
-    pdf_path = Path(pdf_path)
-
-    if output is None:
-        # Default: sibling .outline.<fmt> next to the PDF
-        output_path = pdf_path.with_suffix(f'.outline.{fmt}')
+    if bookmarks:
+        nodes, next_id = build_nodes_from_bookmarks(bookmarks, total_pages, next_id_start=1)
     else:
-        output_path = Path(output)
+        root = OutlineNode(
+            id=1,
+            title=title or book_id,
+            start_page=1,
+            end_page=max(total_pages, 1),
+            children=[],
+        )
+        nodes = [root]
+        next_id = 2
 
-    _generate_outline_for_pdf(
-        pdf_path=pdf_path,
-        depth=depth,
-        output=output_path,
-        fmt=fmt,
-        model=model,
-        api_key=api_key,
+    workspace = Workspace(
+        book_id=book_id,
+        root_dir=book_dir,
+        pdf_path=pdf_dest,
+        nodes=nodes,
+        next_id=next_id,
+    )
+    save_workspace(workspace, force=force)
+
+    console.print(
+        Panel.fit(
+            f"[bold]Book ID:[/bold] {book_id}\n"
+            f"[bold]PDF:[/bold] {pdf_dest}\n"
+            f"[bold]Outline:[/bold] {outline_path}\n"
+            f"[bold]Outline TXT:[/bold] {book_dir / 'outline.txt'}\n"
+            f"[bold]总页数:[/bold] {total_pages}",
+            title="Workspace 初始化完成",
+            border_style="green",
+        )
     )
 
-    # Print usage & cost summary for this run
-    _print_usage_summary(config, title="LLM 调用统计（大纲生成）")
-    global_usage_tracker.reset()
+
+@main.command("ls")
+@click.argument("book_id", type=str)
+@click.option("--data-root", type=click.Path(), default=None)
+def ls_cmd(book_id: str, data_root: Optional[str]) -> None:
+    """List outline tree with node ids and tuning info."""
+    data_root_path = _resolve_data_root(data_root)
+    workspace = _load_workspace_or_exit(book_id, data_root_path)
+
+    lines = _render_tree(workspace.nodes)
+    console.print(Panel.fit("\n".join(lines) or "[空大纲]", title=f"{book_id} Outline", border_style="blue"))
 
 
-@main.command("book")
-@click.argument('book_name', type=str)
-@click.option(
-    '--data-root',
-    type=click.Path(),
-    default=None,
-    help='数据根目录 (默认: 配置中的 data_root, 默认为 ./data)'
-)
-@click.option(
-    '--depth', '-d',
-    type=int,
-    default=None,
-    help='递归层级深度 (默认: 配置中的 default_depth, 默认为2)'
-)
-@click.option(
-    '--model', '-m',
-    type=str,
-    default=None,
-    help='使用的模型 (默认: 配置中的 model)'
-)
-@click.option(
-    '--api-key',
-    type=str,
-    default=None,
-    help='Dashscope API密钥 (可选，优先使用环境变量/配置文件)'
-)
-def book_cmd(book_name, data_root, depth, model, api_key):
-    """
-    以 data/<book_name>/<book_name>.pdf 为输入，自动完成：
+@main.command("merge")
+@click.argument("book_id", type=str)
+@click.argument("node_ids", nargs=-1, type=int)
+@click.option("--title", type=str, default=None, help="Title for merged node (default: join titles).")
+@click.option("--data-root", type=click.Path(), default=None)
+def merge_cmd(book_id: str, node_ids: List[int], title: Optional[str], data_root: Optional[str]) -> None:
+    """Merge sibling nodes into a single node."""
+    if len(node_ids) < 2:
+        console.print("[red]错误：[/red] merge 至少需要两个节点 ID。")
+        raise SystemExit(1)
 
-    1. 生成 <book_name>.outline.txt
-    2. 调用大模型重写为精简版中文正文
-    3. 在 data/<book_name>/<book_name>/ 下生成 MkDocs (material 主题) 项目
-    """
-    config = Config()
+    data_root_path = _resolve_data_root(data_root)
+    workspace = _load_workspace_or_exit(book_id, data_root_path)
 
-    depth = config.get_default_depth() if depth is None else depth
-    api_key = api_key or config.get_api_key()
-    model = model or config.get_model()
+    parent_ref = None
+    indices: List[int] = []
+    nodes: List[OutlineNode] = []
 
-    if not api_key:
-        console.print("[red]错误：[/red] 未找到 Dashscope API 密钥", style="bold red")
-        console.print("\n请通过以下方式之一设置 API 密钥：")
-        console.print("1. 设置环境变量: export DASHSCOPE_API_KEY=your-key")
-        console.print("2. 运行 outline-gen init-config 创建配置文件")
-        sys.exit(1)
+    for node_id in node_ids:
+        result = find_parent_and_index(workspace.nodes, node_id)
+        if result is None:
+            console.print(f"[red]错误：[/red] 找不到节点 ID {node_id}")
+            raise SystemExit(1)
+        parent, idx, node = result
+        if parent_ref is None:
+            parent_ref = parent
+        elif parent_ref is not parent:
+            console.print("[red]错误：[/red] 需要合并的节点必须是同一父节点下的兄弟节点。")
+            raise SystemExit(1)
+        indices.append(idx)
+        nodes.append(node)
 
-    data_root_path = Path(data_root) if data_root else config.get_data_root()
-    book_dir = data_root_path / book_name
-    pdf_path = book_dir / f"{book_name}.pdf"
-    outline_path = book_dir / f"{book_name}.outline.txt"
-    output_root = book_dir / book_name
+    indices_sorted = sorted(indices)
+    if indices_sorted != list(range(indices_sorted[0], indices_sorted[-1] + 1)):
+        console.print("[red]错误：[/red] 只能合并连续的兄弟节点。")
+        raise SystemExit(1)
 
-    if not pdf_path.exists():
-        console.print(
-            f"[red]错误：[/red] 找不到 PDF 文件: {pdf_path}\n"
-            f"请确保路径为 data_root/book_name/book_name.pdf",
-            style="bold red",
-        )
-        sys.exit(1)
+    container = parent_ref.children if parent_ref else workspace.nodes
+    ordered_nodes = [container[i] for i in indices_sorted]
 
-    console.print(Panel.fit(
-        f"[bold]书名(文件夹):[/bold] {book_name}\n"
-        f"[bold]数据根目录:[/bold] {data_root_path}\n"
-        f"[bold]PDF路径:[/bold] {pdf_path}\n"
-        f"[bold]大纲输出:[/bold] {outline_path}\n"
-        f"[bold]重写输出(MkDocs):[/bold] {output_root}\n"
-        f"[bold]递归层级:[/bold] {depth}\n"
-        f"[bold]书籍类型:[/bold] 自动推断（基于大纲）\n"
-        f"[bold]使用模型:[/bold] {model}",
-        title="Book 模式配置",
-        border_style="magenta",
-    ))
+    merged_title = title or " + ".join(n.title for n in ordered_nodes)
+    merged_children: List[OutlineNode] = []
+    for node in ordered_nodes:
+        merged_children.extend(node.children)
 
-    # 1) Generate outline.txt under data/<book_name>/ (with optional overwrite prompt)
-    if outline_path.exists():
-        console.print(
-            f"[yellow]检测到已存在大纲文件:[/yellow] {outline_path}\n"
-            "[yellow]是否重新生成并覆盖该文件？[/yellow]"
-        )
-        if click.confirm("重新生成大纲？", default=False):
-            _generate_outline_for_pdf(
-                pdf_path=pdf_path,
-                depth=depth,
-                output=outline_path,
-                fmt="txt",
-                model=model,
-                api_key=api_key,
-            )
-        else:
-            console.print("[green]将跳过大纲生成，直接使用现有大纲文件。[/green]")
-    else:
-        _generate_outline_for_pdf(
-            pdf_path=pdf_path,
-            depth=depth,
-            output=outline_path,
-            fmt="txt",
-            model=model,
-            api_key=api_key,
-        )
-
-    # 2) Rewrite book into MkDocs project using BookRewriter
-    console.print("\n[bold green]开始使用大模型重写全书...[/bold green]\n")
-    rewriter = BookRewriter(
-        pdf_path=str(pdf_path),
-        outline_txt_path=str(outline_path),
-        output_root=str(output_root),
-        api_key=api_key,
-        model=model,
+    merged_node = OutlineNode(
+        id=workspace.next_id,
+        title=merged_title,
+        start_page=min(n.start_page for n in ordered_nodes),
+        end_page=max(n.end_page for n in ordered_nodes),
+        children=merged_children,
     )
-    rewriter.rewrite_book()
-    console.print(f"\n[bold green]✓ 全书重写完成！[/bold green]")
-    console.print(f"[blue]MkDocs 项目路径: {output_root}[/blue]")
+    workspace.next_id += 1
 
-    # Print combined usage & cost summary for outline + rewrite
-    _print_usage_summary(config, title="LLM 调用统计（大纲生成 + 全书重写）")
-    global_usage_tracker.reset()
+    for idx in reversed(indices_sorted):
+        container.pop(idx)
+    container.insert(indices_sorted[0], merged_node)
+
+    recompute_ranges(workspace.nodes)
+    save_workspace(workspace, force=True)
+
+    console.print(f"[green]✓[/green] 已合并节点 -> 新节点 ID {merged_node.id}")
 
 
-if __name__ == '__main__':
+@main.command("split")
+@click.argument("book_id", type=str)
+@click.argument("node_id", type=int, required=False)
+@click.option("--all-leaves", is_flag=True, help="Split all current leaf nodes.")
+@click.option("--model", type=str, default=None)
+@click.option("--api-key", type=str, default=None)
+@click.option("--data-root", type=click.Path(), default=None)
+def split_cmd(
+    book_id: str,
+    node_id: Optional[int],
+    all_leaves: bool,
+    model: Optional[str],
+    api_key: Optional[str],
+    data_root: Optional[str],
+) -> None:
+    """Split leaf node(s) using LLM-generated outline."""
+    cfg = Config()
+    data_root_path = _resolve_data_root(data_root)
+    workspace = _load_workspace_or_exit(book_id, data_root_path)
+
+    if all_leaves and node_id is not None:
+        console.print("[red]错误：[/red] 使用 --all-leaves 时不要传 node_id。")
+        raise SystemExit(1)
+    if not all_leaves and node_id is None:
+        console.print("[red]错误：[/red] 请提供 node_id 或使用 --all-leaves。")
+        raise SystemExit(1)
+
+    api_key = api_key or cfg.get_api_key()
+    if not api_key:
+        console.print("[red]错误：[/red] 未找到 Dashscope API 密钥")
+        raise SystemExit(1)
+
+    model = model or cfg.get_model()
+    llm = LLMClient(api_key=api_key, model=model)
+
+    def collect_leaves(nodes: List[OutlineNode]) -> List[OutlineNode]:
+        leaves: List[OutlineNode] = []
+
+        def walk(n: OutlineNode) -> None:
+            if not n.children:
+                leaves.append(n)
+                return
+            for child in n.children:
+                walk(child)
+
+        for root in nodes:
+            walk(root)
+        return leaves
+
+    targets = collect_leaves(workspace.nodes) if all_leaves else [find_node(workspace.nodes, node_id)]
+    targets = [t for t in targets if t is not None]
+    if not targets:
+        console.print("[red]错误：[/red] 未找到可拆分的叶子节点。")
+        raise SystemExit(1)
+
+    failed: List[int] = []
+
+    with PDFProcessor(str(workspace.pdf_path)) as processor:
+        for target in targets:
+            if target.children:
+                continue
+            console.print(f"[yellow]正在使用模型 {model} 拆分节点 {target.id}...[/yellow]")
+            text = processor.extract_text_with_pages_range(target.start_page, target.end_page)
+            items = llm.generate_outline(text, parent_title=target.title)
+            items = [item for item in items if target.start_page <= item.page <= target.end_page]
+
+            if len(items) < 2:
+                failed.append(target.id)
+                continue
+
+            items.sort(key=lambda i: i.page)
+            new_children: List[OutlineNode] = []
+            for idx, item in enumerate(items):
+                start_page = max(item.page, target.start_page)
+                if idx < len(items) - 1:
+                    next_page = max(items[idx + 1].page, start_page)
+                    end_page = max(start_page, next_page - 1)
+                else:
+                    end_page = target.end_page
+
+                child = OutlineNode(
+                    id=workspace.next_id,
+                    title=item.title,
+                    start_page=start_page,
+                    end_page=end_page,
+                    children=[],
+                )
+                workspace.next_id += 1
+                new_children.append(child)
+
+            target.children = new_children
+
+    recompute_ranges(workspace.nodes)
+    save_workspace(workspace, force=True)
+
+    if failed:
+        console.print(f"[yellow]部分节点未能拆分：{', '.join(str(i) for i in failed)}[/yellow]")
+    console.print("[green]✓[/green] 拆分完成。")
+
+
+if __name__ == "__main__":
     main()

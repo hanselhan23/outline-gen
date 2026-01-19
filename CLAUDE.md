@@ -87,3 +87,7 @@ Dashscope API 凭证配置方式：
 - 环境变量（DASHSCOPE_API_KEY）
 - 用户目录配置文件（~/.outline-gen/config.yaml）
 - 禁止将 API 密钥提交到代码仓库
+
+## 重要约定
+
+- 使用中文输出代码注释和返回结果
