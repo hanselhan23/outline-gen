@@ -5,10 +5,12 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import yaml
 
+from .node_paths import build_node_dir_map, resolve_leaf_path
+from .workspace import OutlineNode
 
 @dataclass(frozen=True)
 class SiteBuildConfig:
@@ -16,10 +18,13 @@ class SiteBuildConfig:
     site_dir: Path
     config_path: Path
     site_name: str
+    outline_nodes: List[OutlineNode]
+    write_index: bool = True
+    run_mkdocs: bool = True
 
 
 def build_site(config: SiteBuildConfig) -> None:
-    """为指定的 Markdown 目录生成静态站点。"""
+    """生成 mkdocs 配置并可选构建站点。"""
     docs_dir = config.docs_dir.resolve()
     site_dir = config.site_dir.resolve()
     config_path = config.config_path.resolve()
@@ -27,15 +32,17 @@ def build_site(config: SiteBuildConfig) -> None:
     if not docs_dir.exists():
         raise FileNotFoundError(f"文档目录不存在: {docs_dir}")
 
-    index_path = _write_index(docs_dir, title=config.site_name)
-    nav = _build_nav(docs_dir, index_path)
-    mkdocs_config = {
-        "site_name": config.site_name,
-        "docs_dir": str(docs_dir),
-        "site_dir": str(site_dir),
-        "theme": {"name": "material", "features": ["navigation.footer"]},
-        "nav": nav,
-    }
+    index_path = docs_dir / "index.md"
+    if config.write_index:
+        index_path = _write_index(docs_dir, title=config.site_name)
+
+    mkdocs_config = _build_mkdocs_config(
+        docs_dir=docs_dir,
+        site_dir=site_dir,
+        site_name=config.site_name,
+        outline_nodes=config.outline_nodes,
+        index_path=index_path if index_path.exists() else None,
+    )
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
@@ -43,10 +50,11 @@ def build_site(config: SiteBuildConfig) -> None:
         encoding="utf-8",
     )
 
-    subprocess.run(
-        ["mkdocs", "build", "-f", str(config_path)],
-        check=True,
-    )
+    if config.run_mkdocs:
+        subprocess.run(
+            ["mkdocs", "build", "-f", str(config_path)],
+            check=True,
+        )
 
 
 def _write_index(docs_dir: Path, title: str) -> Path:
@@ -62,61 +70,66 @@ def _write_index(docs_dir: Path, title: str) -> Path:
     return index_path
 
 
-def _build_nav(docs_dir: Path, index_path: Path) -> List[Dict[str, object]]:
+def _build_mkdocs_config(
+    docs_dir: Path,
+    site_dir: Path,
+    site_name: str,
+    outline_nodes: List[OutlineNode],
+    index_path: Optional[Path],
+) -> Dict[str, object]:
+    nav = _build_nav(docs_dir, outline_nodes, index_path)
+    return {
+        "site_name": site_name,
+        "docs_dir": str(docs_dir),
+        "site_dir": str(site_dir),
+        "theme": {"name": "material", "features": ["navigation.footer"]},
+        "use_directory_urls": False,
+        "nav": nav,
+    }
+
+
+def _build_nav(
+    docs_dir: Path,
+    outline_nodes: List[OutlineNode],
+    index_path: Optional[Path],
+) -> List[Dict[str, object]]:
     """构建 mkdocs 导航。"""
-    nav: List[Dict[str, object]] = [{"首页": index_path.relative_to(docs_dir).as_posix()}]
-    for entry in _build_nav_entries(docs_dir, docs_dir):
+    nav: List[Dict[str, object]] = []
+    if index_path is not None:
+        nav.append({"首页": index_path.relative_to(docs_dir).as_posix()})
+    if not outline_nodes:
+        return nav
+    path_map = build_node_dir_map(outline_nodes)
+    for entry in _build_nav_from_nodes(outline_nodes, docs_dir, path_map):
         nav.append(entry)
     return nav
 
 
-def _build_nav_entries(current_dir: Path, docs_dir: Path) -> List[Dict[str, object]]:
+def _build_nav_from_nodes(
+    nodes: List[OutlineNode],
+    docs_dir: Path,
+    path_map: Dict[int, List[str]],
+) -> List[Dict[str, object]]:
     entries: List[Dict[str, object]] = []
-    for subdir in _sorted_subdirs(current_dir):
-        sub_entries = _build_nav_entries(subdir, docs_dir)
-        index_path = subdir / "index.md"
-        if sub_entries:
-            title = _display_name_from_dir(subdir.name)
-            entries.append({title: sub_entries})
-        elif index_path.exists():
-            title = _read_markdown_title(index_path) or _display_name_from_dir(subdir.name)
-            rel_path = index_path.relative_to(docs_dir).as_posix()
-            entries.append({title: rel_path})
+    for node in _sorted_nodes(nodes):
+        if node.children:
+            children_entries = _build_nav_from_nodes(node.children, docs_dir, path_map)
+            if not children_entries:
+                continue
+            entries.append({node.title: children_entries})
+            continue
+
+        leaf_path = resolve_leaf_path(docs_dir, path_map, node)
+        if not leaf_path.exists():
+            continue
+        title = _read_markdown_title(leaf_path) or node.title or leaf_path.stem
+        entries.append({title: leaf_path.relative_to(docs_dir).as_posix()})
+
     return entries
 
 
-def _iter_leaf_indexes(current_dir: Path, docs_dir: Path) -> List[Path]:
-    subdirs = _sorted_subdirs(current_dir)
-    if not subdirs:
-        if current_dir == docs_dir:
-            return []
-        index_path = current_dir / "index.md"
-        return [index_path] if index_path.exists() else []
-    leaf_indexes: List[Path] = []
-    for subdir in subdirs:
-        leaf_indexes.extend(_iter_leaf_indexes(subdir, docs_dir))
-    return leaf_indexes
-
-
-def _sorted_subdirs(current_dir: Path) -> List[Path]:
-    subdirs = [path for path in current_dir.iterdir() if path.is_dir()]
-    return sorted(subdirs, key=_dir_sort_key)
-
-
-def _dir_sort_key(path: Path) -> Tuple[int, str]:
-    order = _parse_dir_order(path.name)
-    if order is None:
-        return (10**9, path.name)
-    return (order, path.name)
-
-
-def _parse_dir_order(name: str) -> Optional[int]:
-    if "__" not in name:
-        return None
-    suffix = name.rsplit("__", 1)[-1]
-    if suffix.isdigit():
-        return int(suffix)
-    return None
+def _sorted_nodes(nodes: List[OutlineNode]) -> List[OutlineNode]:
+    return sorted(nodes, key=lambda node: (node.start_page, node.id))
 
 
 def _read_markdown_title(path: Path) -> Optional[str]:
@@ -127,13 +140,3 @@ def _read_markdown_title(path: Path) -> Optional[str]:
     except OSError:
         return None
     return None
-
-
-def _display_name_from_dir(name: str) -> str:
-    base = name.split("__", 1)[0]
-    base = base.replace("-", " ").strip()
-    return base or name
-
-
-def _has_subdirs(path: Path) -> bool:
-    return any(child.is_dir() for child in path.iterdir())

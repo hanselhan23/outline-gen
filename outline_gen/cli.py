@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import shutil
-import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -33,6 +32,7 @@ from .workspace import (
     recompute_ranges,
     save_workspace,
 )
+from .node_paths import build_node_dir_map, resolve_leaf_path
 
 
 console = Console()
@@ -128,44 +128,10 @@ def _prepare_output_dir(path_value: Optional[str], fallback: Path) -> Path:
     return output_dir
 
 
-def _sanitize_path_component(value: str) -> str:
-    value = value.strip()
-    if not value:
-        return ""
-    value = value.replace("/", "-").replace("\\", "-")
-    value = re.sub(r"\s+", "-", value)
-    cleaned = "".join(ch for ch in value if ch.isalnum() or ch in ("-", "_"))
-    return cleaned.strip("-_")
-
-
-def _node_dir_name(node: OutlineNode) -> str:
-    safe_title = _sanitize_path_component(node.title) or "node"
-    return f"{safe_title}__{node.id}"
-
-
-def _build_node_dir_map(nodes: List[OutlineNode]) -> Dict[int, List[str]]:
-    path_map: Dict[int, List[str]] = {}
-
-    def walk(node: OutlineNode, parent_parts: List[str]) -> None:
-        dir_name = _node_dir_name(node)
-        parts = parent_parts + [dir_name]
-        path_map[node.id] = parts
-        for child in node.children:
-            walk(child, parts)
-
-    for root in nodes:
-        walk(root, [])
-
-    return path_map
-
-
 def _resolve_leaf_output_path(output_dir: Path, path_map: Dict[int, List[str]], leaf: OutlineNode) -> Path:
-    parts = path_map.get(leaf.id)
-    if not parts:
-        raise ValueError(f"未找到节点路径: {leaf.id}")
-    target_dir = output_dir.joinpath(*parts)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / "index.md"
+    target_path = resolve_leaf_path(output_dir, path_map, leaf)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    return target_path
 
 
 def _write_markdown(path: Path, content: str, overwrite: bool) -> bool:
@@ -448,7 +414,7 @@ def summarize_cmd(
         raise SystemExit(1)
 
     output_dir_path = _prepare_output_dir(output_dir, workspace.root_dir / "summaries")
-    path_map = _build_node_dir_map(workspace.nodes)
+    path_map = build_node_dir_map(workspace.nodes)
     skipped: List[int] = []
 
     with PDFProcessor(str(workspace.pdf_path)) as processor:
@@ -505,7 +471,7 @@ def tag_cmd(
         raise SystemExit(1)
 
     output_dir_path = _prepare_output_dir(output_dir, workspace.root_dir / "tags")
-    path_map = _build_node_dir_map(workspace.nodes)
+    path_map = build_node_dir_map(workspace.nodes)
     skipped: List[int] = []
 
     with PDFProcessor(str(workspace.pdf_path)) as processor:
@@ -539,6 +505,8 @@ def tag_cmd(
 @click.option("--docs-dir", type=click.Path(), default=None)
 @click.option("--site-dir", type=click.Path(), default=None)
 @click.option("--site-name", type=str, default=None)
+@click.option("--only-config", is_flag=True, help="仅生成 mkdocs 配置文件，不执行构建。")
+@click.option("--skip-index", is_flag=True, help="不生成站点首页 index.md。")
 @click.option("--data-root", type=click.Path(), default=None)
 def build_site_cmd(
     book_id: str,
@@ -546,6 +514,8 @@ def build_site_cmd(
     docs_dir: Optional[str],
     site_dir: Optional[str],
     site_name: Optional[str],
+    only_config: bool,
+    skip_index: bool,
     data_root: Optional[str],
 ) -> None:
     """Build mkdocs static site from existing markdown files."""
@@ -572,9 +542,15 @@ def build_site_cmd(
             site_dir=site_dir_path,
             config_path=config_path,
             site_name=site_name_value,
+            outline_nodes=workspace.nodes,
+            write_index=not skip_index and not only_config,
+            run_mkdocs=not only_config,
         )
     )
-    console.print(f"[green]✓[/green] 站点已生成: {site_dir_path}")
+    if only_config:
+        console.print(f"[green]✓[/green] 配置已生成: {config_path}")
+    else:
+        console.print(f"[green]✓[/green] 站点已生成: {site_dir_path}")
 
 
 @main.command("init-tags-template")

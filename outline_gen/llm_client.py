@@ -286,12 +286,14 @@ class LLMClient:
             f"{idx + 1}. {tag.name}：{tag.prompt}" for idx, tag in enumerate(tag_template.tags)
         )
         return (
-            f"请阅读章节《{title}》的内容，并按以下标签提取要点。\n"
+            f"请阅读章节《{title}》的内容，并按以下标签分类提取书中原始文段。\n"
             "输出要求：\n"
             "1. 使用 Markdown 格式。\n"
             "2. 按标签顺序输出，每个标签用二级标题：## 标签名。\n"
             "3. 每个标签下用要点列表，若没有信息请写“无”。\n"
             "4. 不要输出与标签无关的内容。\n\n"
+            "5. 通过摘录原文的方式提取，不要进行改写或总结。\n\n"
+            "6. 使用双引号包裹，代表是原文摘录。\n\n"
             "标签定义：\n"
             f"{tag_lines}\n\n"
             "待分析文本如下：\n"
