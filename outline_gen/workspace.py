@@ -57,7 +57,8 @@ class Workspace:
         return self.root_dir / "outline.txt"
 
 
-def _collect_nodes(nodes: List[OutlineNode]) -> List[OutlineNode]:
+def collect_nodes(nodes: List[OutlineNode]) -> List[OutlineNode]:
+    """扁平化收集所有节点。"""
     collected: List[OutlineNode] = []
 
     def walk(node: OutlineNode) -> None:
@@ -71,8 +72,25 @@ def _collect_nodes(nodes: List[OutlineNode]) -> List[OutlineNode]:
     return collected
 
 
+def collect_leaf_nodes(nodes: List[OutlineNode]) -> List[OutlineNode]:
+    """收集所有叶子节点。"""
+    leaves: List[OutlineNode] = []
+
+    def walk(node: OutlineNode) -> None:
+        if not node.children:
+            leaves.append(node)
+            return
+        for child in node.children:
+            walk(child)
+
+    for root in nodes:
+        walk(root)
+
+    return leaves
+
+
 def _infer_next_id(nodes: List[OutlineNode]) -> int:
-    ids = [node.id for node in _collect_nodes(nodes)]
+    ids = [node.id for node in collect_nodes(nodes)]
     return max(ids, default=0) + 1
 
 

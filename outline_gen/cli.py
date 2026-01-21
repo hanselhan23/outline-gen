@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import shutil
+import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import click
 from rich.console import Console
@@ -13,10 +14,18 @@ from rich.panel import Panel
 from .config import Config
 from .llm_client import LLMClient
 from .pdf_processor import PDFProcessor
+from .site_builder import SiteBuildConfig, build_site
+from .tag_template import (
+    list_template_types,
+    load_tag_template,
+    resolve_tag_template_path,
+    write_default_tag_template,
+)
 from .workspace import (
     OutlineNode,
     Workspace,
     build_nodes_from_bookmarks,
+    collect_leaf_nodes,
     compute_subtree_stats,
     find_node,
     find_parent_and_index,
@@ -52,9 +61,16 @@ def _load_workspace_or_exit(book_id: str, data_root: Path) -> Workspace:
         raise SystemExit(1)
 
 
+def _build_llm_client(cfg: Config, api_key: Optional[str], model: Optional[str]) -> LLMClient:
+    api_key = api_key or cfg.get_api_key()
+    if not api_key:
+        console.print("[red]错误：[/red] 未找到 Dashscope API 密钥")
+        raise SystemExit(1)
+    return LLMClient(api_key=api_key, model=model or cfg.get_model())
+
+
 def _render_tree(nodes: List[OutlineNode]) -> List[str]:
     stats = compute_subtree_stats(nodes)
-
     lines: List[str] = []
 
     def fmt_node(node: OutlineNode) -> str:
@@ -76,6 +92,104 @@ def _render_tree(nodes: List[OutlineNode]) -> List[str]:
         walk(root, "", idx == len(nodes) - 1)
 
     return lines
+
+
+def _render_summary_markdown(node: OutlineNode, summary: str) -> str:
+    return "\n".join(
+        [
+            f"# {node.title}",
+            "",
+            f"页码范围: {node.start_page}-{node.end_page}",
+            "",
+            "## 总结",
+            summary.strip(),
+            "",
+        ]
+    )
+
+
+def _render_tag_markdown(node: OutlineNode, template_name: str, tag_notes: str) -> str:
+    return "\n".join(
+        [
+            f"# {node.title}",
+            "",
+            f"页码范围: {node.start_page}-{node.end_page}",
+            f"标签模板: {template_name}",
+            "",
+            tag_notes.strip(),
+            "",
+        ]
+    )
+
+
+def _prepare_output_dir(path_value: Optional[str], fallback: Path) -> Path:
+    output_dir = Path(path_value) if path_value else fallback
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _sanitize_path_component(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    value = value.replace("/", "-").replace("\\", "-")
+    value = re.sub(r"\s+", "-", value)
+    cleaned = "".join(ch for ch in value if ch.isalnum() or ch in ("-", "_"))
+    return cleaned.strip("-_")
+
+
+def _node_dir_name(node: OutlineNode) -> str:
+    safe_title = _sanitize_path_component(node.title) or "node"
+    return f"{safe_title}__{node.id}"
+
+
+def _build_node_dir_map(nodes: List[OutlineNode]) -> Dict[int, List[str]]:
+    path_map: Dict[int, List[str]] = {}
+
+    def walk(node: OutlineNode, parent_parts: List[str]) -> None:
+        dir_name = _node_dir_name(node)
+        parts = parent_parts + [dir_name]
+        path_map[node.id] = parts
+        for child in node.children:
+            walk(child, parts)
+
+    for root in nodes:
+        walk(root, [])
+
+    return path_map
+
+
+def _resolve_leaf_output_path(output_dir: Path, path_map: Dict[int, List[str]], leaf: OutlineNode) -> Path:
+    parts = path_map.get(leaf.id)
+    if not parts:
+        raise ValueError(f"未找到节点路径: {leaf.id}")
+    target_dir = output_dir.joinpath(*parts)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir / "index.md"
+
+
+def _write_markdown(path: Path, content: str, overwrite: bool) -> bool:
+    if path.exists() and not overwrite:
+        return False
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def _resolve_template_source(template_path: Optional[str], template_type: Optional[str]) -> Path:
+    if template_path and template_type:
+        console.print("[red]错误：[/red] --template 与 --template-type 只能选一个。")
+        raise SystemExit(1)
+    if template_path:
+        return Path(template_path)
+    if template_type:
+        try:
+            return resolve_tag_template_path(template_type)
+        except ValueError as exc:
+            types = ", ".join(list_template_types())
+            console.print(f"[red]错误：[/red] {exc}，可选类型: {types}")
+            raise SystemExit(1)
+    console.print("[red]错误：[/red] 请提供 --template 或 --template-type。")
+    raise SystemExit(1)
 
 
 @click.group()
@@ -254,29 +368,9 @@ def split_cmd(
         console.print("[red]错误：[/red] 请提供 node_id 或使用 --all-leaves。")
         raise SystemExit(1)
 
-    api_key = api_key or cfg.get_api_key()
-    if not api_key:
-        console.print("[red]错误：[/red] 未找到 Dashscope API 密钥")
-        raise SystemExit(1)
+    llm = _build_llm_client(cfg, api_key=api_key, model=model)
 
-    model = model or cfg.get_model()
-    llm = LLMClient(api_key=api_key, model=model)
-
-    def collect_leaves(nodes: List[OutlineNode]) -> List[OutlineNode]:
-        leaves: List[OutlineNode] = []
-
-        def walk(n: OutlineNode) -> None:
-            if not n.children:
-                leaves.append(n)
-                return
-            for child in n.children:
-                walk(child)
-
-        for root in nodes:
-            walk(root)
-        return leaves
-
-    targets = collect_leaves(workspace.nodes) if all_leaves else [find_node(workspace.nodes, node_id)]
+    targets = collect_leaf_nodes(workspace.nodes) if all_leaves else [find_node(workspace.nodes, node_id)]
     targets = [t for t in targets if t is not None]
     if not targets:
         console.print("[red]错误：[/red] 未找到可拆分的叶子节点。")
@@ -288,7 +382,7 @@ def split_cmd(
         for target in targets:
             if target.children:
                 continue
-            console.print(f"[yellow]正在使用模型 {model} 拆分节点 {target.id}...[/yellow]")
+            console.print(f"[yellow]正在使用模型 {llm.model} 拆分节点 {target.id}...[/yellow]")
             text = processor.extract_text_with_pages_range(target.start_page, target.end_page)
             items = llm.generate_outline(text, parent_title=target.title)
             items = [item for item in items if target.start_page <= item.page <= target.end_page]
@@ -325,6 +419,188 @@ def split_cmd(
     if failed:
         console.print(f"[yellow]部分节点未能拆分：{', '.join(str(i) for i in failed)}[/yellow]")
     console.print("[green]✓[/green] 拆分完成。")
+
+
+@main.command("summarize")
+@click.argument("book_id", type=str)
+@click.option("--output-dir", type=click.Path(), default=None)
+@click.option("--overwrite", is_flag=True, help="Overwrite existing summary files.")
+@click.option("--model", type=str, default=None)
+@click.option("--api-key", type=str, default=None)
+@click.option("--data-root", type=click.Path(), default=None)
+def summarize_cmd(
+    book_id: str,
+    output_dir: Optional[str],
+    overwrite: bool,
+    model: Optional[str],
+    api_key: Optional[str],
+    data_root: Optional[str],
+) -> None:
+    """Summarize all leaf nodes and save markdown files."""
+    cfg = Config()
+    data_root_path = _resolve_data_root(data_root)
+    workspace = _load_workspace_or_exit(book_id, data_root_path)
+    llm = _build_llm_client(cfg, api_key=api_key, model=model)
+
+    leaves = collect_leaf_nodes(workspace.nodes)
+    if not leaves:
+        console.print("[red]错误：[/red] 当前大纲没有叶子节点。")
+        raise SystemExit(1)
+
+    output_dir_path = _prepare_output_dir(output_dir, workspace.root_dir / "summaries")
+    path_map = _build_node_dir_map(workspace.nodes)
+    skipped: List[int] = []
+
+    with PDFProcessor(str(workspace.pdf_path)) as processor:
+        for leaf in leaves:
+            text = processor.extract_text_for_page_range(leaf.start_page, leaf.end_page)
+            if not text.strip():
+                console.print(f"[yellow]跳过节点 {leaf.id}：未提取到文本[/yellow]")
+                skipped.append(leaf.id)
+                continue
+
+            console.print(f"[yellow]正在生成摘要：节点 {leaf.id}...[/yellow]")
+            summary = llm.generate_leaf_summary(text, title=leaf.title)
+            content = _render_summary_markdown(leaf, summary)
+            output_path = _resolve_leaf_output_path(output_dir_path, path_map, leaf)
+            if not _write_markdown(output_path, content, overwrite=overwrite):
+                skipped.append(leaf.id)
+
+    console.print(f"[green]✓[/green] 摘要生成完成，输出目录: {output_dir_path}")
+    if skipped:
+        console.print(f"[yellow]未写入的节点：{', '.join(str(i) for i in skipped)}[/yellow]")
+
+
+@main.command("tag")
+@click.argument("book_id", type=str)
+@click.option("--template", "template_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--template-type", type=str)
+@click.option("--output-dir", type=click.Path(), default=None)
+@click.option("--overwrite", is_flag=True, help="Overwrite existing tag files.")
+@click.option("--model", type=str, default=None)
+@click.option("--api-key", type=str, default=None)
+@click.option("--data-root", type=click.Path(), default=None)
+def tag_cmd(
+    book_id: str,
+    template_path: Optional[str],
+    template_type: Optional[str],
+    output_dir: Optional[str],
+    overwrite: bool,
+    model: Optional[str],
+    api_key: Optional[str],
+    data_root: Optional[str],
+) -> None:
+    """Extract tag notes for all leaf nodes."""
+    cfg = Config()
+    data_root_path = _resolve_data_root(data_root)
+    workspace = _load_workspace_or_exit(book_id, data_root_path)
+    llm = _build_llm_client(cfg, api_key=api_key, model=model)
+
+    template_source = _resolve_template_source(template_path, template_type)
+    tag_template = load_tag_template(template_source)
+
+    leaves = collect_leaf_nodes(workspace.nodes)
+    if not leaves:
+        console.print("[red]错误：[/red] 当前大纲没有叶子节点。")
+        raise SystemExit(1)
+
+    output_dir_path = _prepare_output_dir(output_dir, workspace.root_dir / "tags")
+    path_map = _build_node_dir_map(workspace.nodes)
+    skipped: List[int] = []
+
+    with PDFProcessor(str(workspace.pdf_path)) as processor:
+        for leaf in leaves:
+            text = processor.extract_text_for_page_range(leaf.start_page, leaf.end_page)
+            if not text.strip():
+                console.print(f"[yellow]跳过节点 {leaf.id}：未提取到文本[/yellow]")
+                skipped.append(leaf.id)
+                continue
+
+            console.print(f"[yellow]正在提取标签：节点 {leaf.id}...[/yellow]")
+            tag_notes = llm.generate_tag_notes(text, title=leaf.title, tag_template=tag_template)
+            content = _render_tag_markdown(leaf, tag_template.name, tag_notes)
+            output_path = _resolve_leaf_output_path(output_dir_path, path_map, leaf)
+            if not _write_markdown(output_path, content, overwrite=overwrite):
+                skipped.append(leaf.id)
+
+    console.print(f"[green]✓[/green] 标签提取完成，输出目录: {output_dir_path}")
+    if skipped:
+        console.print(f"[yellow]未写入的节点：{', '.join(str(i) for i in skipped)}[/yellow]")
+
+
+@main.command("build-site")
+@click.argument("book_id", type=str)
+@click.option(
+    "--source",
+    type=click.Choice(["tags", "summaries"], case_sensitive=False),
+    default="tags",
+    show_default=True,
+)
+@click.option("--docs-dir", type=click.Path(), default=None)
+@click.option("--site-dir", type=click.Path(), default=None)
+@click.option("--site-name", type=str, default=None)
+@click.option("--data-root", type=click.Path(), default=None)
+def build_site_cmd(
+    book_id: str,
+    source: str,
+    docs_dir: Optional[str],
+    site_dir: Optional[str],
+    site_name: Optional[str],
+    data_root: Optional[str],
+) -> None:
+    """Build mkdocs static site from existing markdown files."""
+    data_root_path = _resolve_data_root(data_root)
+    workspace = _load_workspace_or_exit(book_id, data_root_path)
+    source_key = source.lower()
+
+    if docs_dir:
+        docs_dir_path = Path(docs_dir)
+        if not docs_dir_path.is_absolute():
+            docs_dir_path = workspace.root_dir / docs_dir_path
+    else:
+        docs_dir_path = workspace.root_dir / source_key
+
+    site_suffix = f"{source_key}_site"
+    site_dir_path = Path(site_dir) if site_dir else workspace.root_dir / site_suffix
+    config_path = workspace.root_dir / f"{site_suffix}.mkdocs.yml"
+    default_site_name = f"{book_id} 标签" if source_key == "tags" else f"{book_id} 摘要"
+    site_name_value = site_name or default_site_name
+
+    build_site(
+        SiteBuildConfig(
+            docs_dir=docs_dir_path,
+            site_dir=site_dir_path,
+            config_path=config_path,
+            site_name=site_name_value,
+        )
+    )
+    console.print(f"[green]✓[/green] 站点已生成: {site_dir_path}")
+
+
+@main.command("init-tags-template")
+@click.argument("book_id", type=str)
+@click.option("--path", "path_value", type=click.Path(), default=None)
+@click.option("--data-root", type=click.Path(), default=None)
+@click.option("--force", is_flag=True, help="Overwrite existing template file.")
+def init_tags_template_cmd(
+    book_id: str,
+    path_value: Optional[str],
+    data_root: Optional[str],
+    force: bool,
+) -> None:
+    """Create a default tag template YAML for a book."""
+    data_root_path = _resolve_data_root(data_root)
+    book_dir = data_root_path / book_id
+    target_path = Path(path_value) if path_value else book_dir / "tag_template.yaml"
+
+    try:
+        path = write_default_tag_template(target_path, force=force)
+    except FileExistsError as exc:
+        console.print(f"[red]错误：[/red] {exc}")
+        console.print("使用 --force 进行覆盖。")
+        raise SystemExit(1)
+
+    console.print(f"[green]✓[/green] 已创建标签模板: {path}")
 
 
 if __name__ == "__main__":

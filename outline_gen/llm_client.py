@@ -1,21 +1,24 @@
-"""LLM integration module for outline generation using Dashscope via OpenAI framework."""
+"""LLM 集成模块：大纲、摘要与标签提取。"""
+
+from __future__ import annotations
 
 import os
-import json
 import re
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
+
 from openai import OpenAI
 
 from .language_utils import is_probably_english
+from .tag_template import TagTemplate
 from .usage_tracker import record_chat_completion_usage
 
 
 class OutlineItem:
-    """Represents a single outline item with title and page number."""
+    """大纲条目。"""
 
-    def __init__(self, title: str, page: int, level: int = 1):
+    def __init__(self, title: str, page: int, level: int = 1) -> None:
         self.title = title
-        self.page = page  # 1-indexed for display
+        self.page = page
         self.level = level
         self.children: List["OutlineItem"] = []
 
@@ -27,18 +30,16 @@ class OutlineItem:
             "children": [child.to_dict() for child in self.children],
         }
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"OutlineItem(title={self.title}, page={self.page}, level={self.level})"
 
 
 class LLMClient:
-    """Client for interacting with Dashscope API via OpenAI framework."""
+    """Dashscope (OpenAI 兼容) 客户端。"""
 
-    # Approximate max characters per chunk to avoid overly long prompts.
-    # The whole文本不会被截断，而是按页标记分块后多次调用模型。
     MAX_CHARS_PER_CHUNK = 15000
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "qwen-turbo"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "qwen-turbo") -> None:
         self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
         if not self.api_key:
             raise ValueError("DASHSCOPE_API_KEY not found in environment or config")
@@ -50,101 +51,115 @@ class LLMClient:
         )
 
     def generate_outline(self, text_content: str, parent_title: str = "") -> List[OutlineItem]:
-        """
-        Generate outline from text content using LLM.
-
-        This method will:
-        - Split the incoming文本按 [Page N] 页码标记分块
-        - 在每个块内部控制长度不超过 MAX_CHARS_PER_CHUNK
-        - 对每个块分别调用一次大模型生成局部大纲
-        - 合并全部块的大纲条目（按页码排序）
-
-        Args:
-            text_content: Text with page markers like [Page N]
-            parent_title: Title of parent section for context
-
-        Returns:
-            List of OutlineItem objects with titles and page numbers
-        """
+        """根据文本生成单层大纲条目。"""
         chunks = self._split_text_into_chunks(text_content)
         all_items: List[OutlineItem] = []
 
         for index, chunk in enumerate(chunks, start=1):
-            prompt = self._create_prompt(
+            prompt = self._create_outline_prompt(
                 chunk,
                 parent_title=parent_title,
                 chunk_index=index,
                 total_chunks=len(chunks),
             )
+            outline_text = self._chat_with_retry(
+                prompt,
+                system_prompt=self._outline_system_prompt(),
+                fallback="（本次生成失败，已跳过）",
+            )
+            items = self._parse_outline(outline_text)
+            all_items.extend(items)
 
-            # Try multiple times for each chunk: if the first responses are
-            # judged to be mostly English, automatically retry a few times.
-            for attempt in range(3):
-                try:
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "你是一个专业的图书大纲生成助手。"
-                                    "你的任务是分析图书内容，生成结构化的中文章节大纲，并标注每个章节的起始页码。"
-                                    "无论原始文本是中文还是其他语言，你输出的所有标题和说明文字都必须使用简体中文。"
-                                    "除少量国际通用缩写（例如 GDP、FDI、PMI 等）外，请不要保留英文单词、短语或章节名"
-                                    "（例如 Introduction、Section、Chapter 等），而是改写为自然流畅的中文表达。"
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": prompt,
-                            },
-                        ],
-                        temperature=0.5,
-                    )
-                except Exception as e:
-                    if attempt == 2:
-                        raise RuntimeError(f"Failed to generate outline: {str(e)}")
-                    continue
-
-                # Record token usage for this call, if available
-                record_chat_completion_usage(self.model, response)
-
-                outline_text = response.choices[0].message.content or ""
-
-                # Validate that the model respected the "Chinese only" requirement.
-                # If the outline appears to be mostly English on early attempts,
-                # automatically retry. If it remains English after all attempts,
-                # still accept the last result instead of raising an error.
-                if is_probably_english(outline_text) and attempt < 2:
-                    continue
-
-                items = self._parse_outline(outline_text)
-                all_items.extend(items)
-                break
-
-        # 合并后按页码排序，避免块之间顺序错乱
         all_items.sort(key=lambda item: item.page)
         return all_items
 
-    def _split_text_into_chunks(self, text_content: str) -> List[str]:
-        """
-        Split long文本 into multiple chunks based on page markers.
+    def generate_leaf_summary(self, text_content: str, title: str) -> str:
+        """生成单个叶子节点的摘要（Markdown）。"""
+        chunks = self._split_text_into_chunks(text_content)
+        if len(chunks) == 1:
+            prompt = self._create_summary_prompt(chunks[0], title=title, chunk_index=1, total_chunks=1)
+            return self._chat_with_retry(
+                prompt,
+                system_prompt=self._summary_system_prompt(),
+                fallback=self._summary_fallback(title),
+            )
 
-        - 优先保证每个块在 [Page N] 边界处分割，避免截断页内容
-        - 每个块的长度控制在 MAX_CHARS_PER_CHUNK 左右
-        - 保证所有文本都被覆盖，不做硬截断
-        """
+        chunk_summaries: List[str] = []
+        for index, chunk in enumerate(chunks, start=1):
+            prompt = self._create_summary_prompt(chunk, title=title, chunk_index=index, total_chunks=len(chunks))
+            chunk_summary = self._chat_with_retry(
+                prompt,
+                system_prompt=self._summary_system_prompt(),
+                fallback=self._summary_fallback(title),
+            )
+            chunk_summaries.append(chunk_summary.strip())
+
+        merge_prompt = self._create_summary_merge_prompt(title=title, summaries=chunk_summaries)
+        return self._chat_with_retry(
+            merge_prompt,
+            system_prompt=self._summary_system_prompt(),
+            fallback=self._summary_fallback(title),
+        )
+
+    def generate_tag_notes(self, text_content: str, title: str, tag_template: TagTemplate) -> str:
+        """根据标签模板提取要点（Markdown）。"""
+        prompt = self._create_tag_prompt(text_content, title=title, tag_template=tag_template)
+        return self._chat_with_retry(
+            prompt,
+            system_prompt=self._tag_system_prompt(),
+            fallback=self._tag_fallback(tag_template),
+        )
+
+    def _chat_with_retry(
+        self,
+        prompt: str,
+        system_prompt: str,
+        temperature: float = 0.5,
+        fallback: str = "",
+    ) -> str:
+        """调用模型，报错时重试两次，最终返回可理解的默认结果。"""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=temperature,
+                )
+                record_chat_completion_usage(self.model, response)
+                content = response.choices[0].message.content or ""
+                if is_probably_english(content) and attempt < max_attempts:
+                    continue
+                return content
+            except Exception:
+                if attempt < max_attempts:
+                    continue
+                return fallback
+        return fallback
+
+    def _summary_fallback(self, title: str) -> str:
+        return f"- 《{title}》摘要生成失败，已跳过。\n- 可稍后重试获取完整内容。"
+
+    def _tag_fallback(self, tag_template: TagTemplate) -> str:
+        parts = []
+        for tag in tag_template.tags:
+            parts.append(f"## {tag.name}\n- 本次标签提取失败，已跳过。")
+        return "\n\n".join(parts)
+
+    def _split_text_into_chunks(self, text_content: str) -> List[str]:
+        """按页标记切分文本，避免过长。"""
         if not text_content:
             return [""]
 
         if len(text_content) <= self.MAX_CHARS_PER_CHUNK:
             return [text_content]
 
-        # 按页标记切分，保留 [Page N] 作为每页的起始
         parts = re.split(r"(?=\[Page \d+\])", text_content)
         parts = [p for p in parts if p.strip()]
 
-        # 如果没有检测到任何页标记，则退化为按字符长度切分
         if not parts:
             chunks: List[str] = []
             text = text_content
@@ -157,7 +172,6 @@ class LLMClient:
         current = ""
 
         for part in parts:
-            # 如果当前块为空，直接放进去，避免单页就超过限制导致死循环
             if not current:
                 current = part
                 continue
@@ -173,32 +187,54 @@ class LLMClient:
 
         return chunks
 
-    def _create_prompt(
+    def _outline_system_prompt(self) -> str:
+        return (
+            "你是一个专业的图书大纲生成助手。"
+            "你的任务是分析图书内容，生成结构化的中文章节大纲，并标注每个章节的起始页码。"
+            "无论原始文本是中文还是其他语言，你输出的所有标题和说明文字都必须使用简体中文。"
+            "除少量国际通用缩写（例如 GDP、FDI、PMI 等）外，请不要保留英文单词、短语或章节名。"
+        )
+
+    def _summary_system_prompt(self) -> str:
+        return (
+            "你是一个专业的中文阅读总结助手。"
+            "请用简体中文输出结果，避免出现英文标题或段落。"
+        )
+
+    def _tag_system_prompt(self) -> str:
+        return (
+            "你是一个阅读笔记整理助手。"
+            "请用简体中文输出结果，避免出现英文标题或段落。"
+        )
+
+    def _create_outline_prompt(
         self,
         chunk_text: str,
         parent_title: str,
         chunk_index: int,
         total_chunks: int,
     ) -> str:
-        """Create prompt for outline generation for a single chunk."""
         context = f"\n当前正在分析的上级章节标题：{parent_title}" if parent_title else ""
         chunk_info = ""
         if total_chunks > 1:
-            chunk_info = f"\n注意：这是本章节内容的第 {chunk_index}/{total_chunks} 个连续片段，请只基于当前片段生成大纲，条目中的页码要严格根据片段中的 [Page N] 推断。"
+            chunk_info = (
+                f"\n注意：这是本章节内容的第 {chunk_index}/{total_chunks} 个连续片段，"
+                "请只基于当前片段生成大纲，条目中的页码要严格根据片段中的 [Page N] 推断。"
+            )
 
-        prompt = (
+        return (
             "你现在拿到的是一段已经按书签拆分好的图书内容片段，文本中包含页码标记 [Page N]。\n"
             "请仔细阅读并理解这段内容，为它生成一个“精炼的中文大纲”，而不是简单抄录原文中的标题。\n\n"
             "请特别注意以下高优先级规则（从高到低）：\n"
-            "1. 如果你判断当前文本主要是图书的“目录/Contents”页，或者几乎全部是“标题 + 页码”的结构（缺少完整段落和句子）：\n"
-            "   那么请不要生成任何新的大纲条目，直接返回一个空字符串（什么也不要输出）。这一条规则优先级最高。\n"
-            "2. 所有大纲条目必须是单层结构，禁止生成子级条目；每一行都是同一层级的条目，行首不能有任何缩进空格。\n"
+            "1. 如果你判断当前文本主要是图书的“目录/Contents”页，或者几乎全部是“标题 + 页码”的结构：\n"
+            "   那么请不要生成任何新的大纲条目，直接返回一个空字符串（什么也不要输出）。\n"
+            "2. 所有大纲条目必须是单层结构，禁止生成子级条目；每一行都是同一层级的条目。\n"
             "3. 每个条目必须包含起始页码信息。\n\n"
             "在不违反以上规则的前提下，请按照下面的要求工作：\n"
-            "4. 从整体理解这段文本的含义，提炼出最重要的 3–5 个子主题或关键问题，而不是逐段机械提取标题。\n"
-            "5. 每个子主题的标题要简洁、有概括性，能够帮读者快速理解这一段主要讲什么，可以适当重写、合并或抽象原文的表述。\n"
-            "6. 为每个子主题标注起始页码（必须包含），页码需要从文本中的 [Page N] 标记推断得到，使用“第N页”的中文格式。\n"
-            "7. 输出格式：每行一个条目，格式为 \"标题 - 第N页\"（注意：行首不能有任何空格，不要使用缩进来表示层级）。\n\n"
+            "4. 从整体理解这段文本的含义，提炼出最重要的 3–5 个子主题或关键问题。\n"
+            "5. 每个子主题的标题要简洁、有概括性，能够帮读者快速理解。\n"
+            "6. 为每个子主题标注起始页码，使用“第N页”的中文格式。\n"
+            "7. 输出格式：每行一个条目，格式为 \"标题 - 第N页\"。\n\n"
             "示例输出格式（仅示例结构与格式，不要照抄示例标题）：\n"
             "本节的三个关键观点 - 第38页\n"
             "方法与数据概览 - 第45页\n"
@@ -209,76 +245,90 @@ class LLMClient:
             f"{chunk_text}\n\n"
             "如果你判断这是目录/Contents 页，请直接返回一个空字符串；\n"
             "否则，请按照上述要求，输出 3–5 个条目的大纲。\n"
-            "特别注意：无论原文是否为英文，你输出的条目标题和说明必须全部使用中文，"
-            "不要保留英文章节标题（如 Introduction、Section I 等），"
-            "可以保留极少量必要的英文缩写（如 GDP/FDI/PMI）。\n"
+            "特别注意：无论原文是否为英文，你输出的条目标题和说明必须全部使用中文。"
         )
 
-        return prompt
+    def _create_summary_prompt(
+        self,
+        chunk_text: str,
+        title: str,
+        chunk_index: int,
+        total_chunks: int,
+    ) -> str:
+        chunk_info = ""
+        if total_chunks > 1:
+            chunk_info = f"\n这是第 {chunk_index}/{total_chunks} 个连续片段，请仅基于该片段提炼要点。"
+
+        return (
+            f"请为章节《{title}》生成简洁摘要，输出 Markdown 要点列表。\n"
+            "要求：\n"
+            "1. 输出 5-8 条要点，使用短句或短段落。\n"
+            "2. 不要复述原文标题，不要出现英文标题。\n"
+            "3. 若信息不足，可以减少要点数量，但不要空输出。\n"
+            f"{chunk_info}\n\n"
+            "待分析文本如下：\n"
+            f"{chunk_text}\n"
+        )
+
+    def _create_summary_merge_prompt(self, title: str, summaries: List[str]) -> str:
+        joined = "\n".join(f"片段{idx + 1}:\n{summary}" for idx, summary in enumerate(summaries))
+        return (
+            f"请合并以下分段摘要，输出章节《{title}》的统一摘要。\n"
+            "输出要求：\n"
+            "1. 使用 Markdown 要点列表。\n"
+            "2. 只保留最重要的 6-10 条要点，避免重复。\n"
+            "3. 不要出现英文标题。\n\n"
+            f"{joined}\n"
+        )
+
+    def _create_tag_prompt(self, text_content: str, title: str, tag_template: TagTemplate) -> str:
+        tag_lines = "\n".join(
+            f"{idx + 1}. {tag.name}：{tag.prompt}" for idx, tag in enumerate(tag_template.tags)
+        )
+        return (
+            f"请阅读章节《{title}》的内容，并按以下标签提取要点。\n"
+            "输出要求：\n"
+            "1. 使用 Markdown 格式。\n"
+            "2. 按标签顺序输出，每个标签用二级标题：## 标签名。\n"
+            "3. 每个标签下用要点列表，若没有信息请写“无”。\n"
+            "4. 不要输出与标签无关的内容。\n\n"
+            "标签定义：\n"
+            f"{tag_lines}\n\n"
+            "待分析文本如下：\n"
+            f"{text_content}\n"
+        )
 
     def _parse_outline(self, outline_text: str) -> List[OutlineItem]:
-        """
-        Parse LLM generated outline text into structured OutlineItem objects.
-
-        Expected format:
-        - "Title - 第N页" or "Title - Page N"
-        - Indentation indicates hierarchy
-        """
-        lines = outline_text.strip().split('\n')
-        items = []
+        lines = outline_text.strip().split("\n")
+        items: List[OutlineItem] = []
 
         for line in lines:
             line = line.rstrip()
             if not line:
                 continue
 
-            # Calculate level based on leading whitespace
             stripped = line.lstrip()
             indent_level = (len(line) - len(stripped)) // 2 + 1
-
-            # Extract title and page number
             title, page = self._extract_title_and_page(stripped)
-
             if title and page:
-                item = OutlineItem(title=title, page=page, level=indent_level)
-                items.append(item)
+                items.append(OutlineItem(title=title, page=page, level=indent_level))
 
         return items
 
     def _extract_title_and_page(self, text: str) -> tuple[Optional[str], Optional[int]]:
-        """
-        Extract title and page number from a line.
-
-        Supports formats:
-        - "Title - 第N页"
-        - "Title - Page N"
-        - "Title (第N页)"
-        - "Title (Page N)"
-        """
-        import re
-
-        # Pattern 1: "Title - 第N页" or "Title - Page N"
         pattern1 = r"^(.+?)\s*[-–—]\s*(?:第|Page\s*)(\d+)(?:页)?"
         match = re.search(pattern1, text, re.IGNORECASE)
         if match:
-            title = match.group(1).strip()
-            page = int(match.group(2))
-            return title, page
+            return match.group(1).strip(), int(match.group(2))
 
-        # Pattern 2: "Title (第N页)" or "Title (Page N)"
         pattern2 = r"^(.+?)\s*\((?:第|Page\s*)(\d+)(?:页)?\)"
         match = re.search(pattern2, text, re.IGNORECASE)
         if match:
-            title = match.group(1).strip()
-            page = int(match.group(2))
-            return title, page
+            return match.group(1).strip(), int(match.group(2))
 
-        # Pattern 3: Just numbers at the end "Title N"
         pattern3 = r"^(.+?)\s+(\d+)\s*$"
         match = re.search(pattern3, text)
         if match:
-            title = match.group(1).strip()
-            page = int(match.group(2))
-            return title, page
+            return match.group(1).strip(), int(match.group(2))
 
         return None, None
