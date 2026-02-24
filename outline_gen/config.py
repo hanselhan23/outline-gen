@@ -9,8 +9,9 @@ from typing import Optional, Dict, Any
 # Default configuration values used when creating a new config file
 # and as a fallback when specific fields are missing from the YAML.
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "dashscope_api_key": "your-api-key-here",
-    "model": "qwen-turbo",
+    "api_key": "",
+    "model": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
     "default_depth": 2,
     "output_format": "txt",
     "data_root": "data",
@@ -18,7 +19,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # default prices, even if YAML does not specify them.
     "pricing": {
         # 示例：请根据实际模型价格修改
-        "qwen-turbo": {
+        "deepseek-chat": {
             "input_per_1k": 0.0003,
             "output_per_1k": 0.0006,
             "currency": "CNY",
@@ -47,18 +48,23 @@ class Config:
                 self._config_data = {}
 
     def get_api_key(self) -> Optional[str]:
-        """Get Dashscope API key from environment or config file."""
+        """Get LLM API key from environment or config file."""
         # Environment variable takes precedence
-        api_key = os.getenv("DASHSCOPE_API_KEY")
-        if api_key:
-            return api_key
+        for env_var in ["DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY"]:
+            api_key = os.getenv(env_var)
+            if api_key:
+                return api_key
 
         # Fall back to config file
-        return self._config_data.get("dashscope_api_key")
+        return self._config_data.get("api_key") or self._config_data.get("dashscope_api_key")
 
     def get_model(self) -> str:
-        """Get model name from config, default to qwen-turbo."""
-        return self._config_data.get("model", "qwen-turbo")
+        """Get model name from config, default to deepseek-chat."""
+        return self._config_data.get("model", "deepseek-chat")
+
+    def get_base_url(self) -> str:
+        """Get OpenAI-compatible base URL for the LLM service."""
+        return self._config_data.get("base_url", "https://api.deepseek.com")
 
     def get_default_depth(self) -> int:
         """Get default recursion depth from config."""

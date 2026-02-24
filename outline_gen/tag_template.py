@@ -50,6 +50,7 @@ TEMPLATE_ALIASES: Dict[str, str] = {
     "fiction": "fiction.yaml",
     "novel": "fiction.yaml",
     "xiaoshuo": "fiction.yaml",
+    "general": "general.yaml"
 }
 
 

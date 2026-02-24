@@ -61,12 +61,18 @@ def _load_workspace_or_exit(book_id: str, data_root: Path) -> Workspace:
         raise SystemExit(1)
 
 
-def _build_llm_client(cfg: Config, api_key: Optional[str], model: Optional[str]) -> LLMClient:
+def _build_llm_client(
+    cfg: Config, api_key: Optional[str], model: Optional[str], base_url: Optional[str] = None
+) -> LLMClient:
     api_key = api_key or cfg.get_api_key()
     if not api_key:
-        console.print("[red]错误：[/red] 未找到 Dashscope API 密钥")
+        console.print("[red]错误：[/red] 未找到 LLM API 密钥")
         raise SystemExit(1)
-    return LLMClient(api_key=api_key, model=model or cfg.get_model())
+    return LLMClient(
+        api_key=api_key,
+        model=model or cfg.get_model(),
+        base_url=base_url or cfg.get_base_url(),
+    )
 
 
 def _render_tree(nodes: List[OutlineNode]) -> List[str]:
@@ -419,7 +425,7 @@ def summarize_cmd(
 
     with PDFProcessor(str(workspace.pdf_path)) as processor:
         for leaf in leaves:
-            text = processor.extract_text_for_page_range(leaf.start_page, leaf.end_page)
+            text = processor.extract_text_with_pages_range(leaf.start_page, leaf.end_page)
             if not text.strip():
                 console.print(f"[yellow]跳过节点 {leaf.id}：未提取到文本[/yellow]")
                 skipped.append(leaf.id)
@@ -476,7 +482,7 @@ def tag_cmd(
 
     with PDFProcessor(str(workspace.pdf_path)) as processor:
         for leaf in leaves:
-            text = processor.extract_text_for_page_range(leaf.start_page, leaf.end_page)
+            text = processor.extract_text_with_pages_range(leaf.start_page, leaf.end_page)
             if not text.strip():
                 console.print(f"[yellow]跳过节点 {leaf.id}：未提取到文本[/yellow]")
                 skipped.append(leaf.id)

@@ -39,15 +39,35 @@ class LLMClient:
 
     MAX_CHARS_PER_CHUNK = 15000
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "qwen-turbo") -> None:
-        self.api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "deepseek-chat",
+        base_url: str = "https://api.deepseek.com",
+    ) -> None:
+        self.api_key = api_key
         if not self.api_key:
-            raise ValueError("DASHSCOPE_API_KEY not found in environment or config")
+            for env_var in ["DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY"]:
+                self.api_key = os.getenv(env_var)
+                if self.api_key:
+                    # 发现 Key，但为了调试，如果是从环境变量来的，打印它的来源（遮蔽大部分）
+                    print(f"DEBUG: Using API key from environment variable {env_var}: {self.api_key[:5]}...")
+                    break
+
+        if not self.api_key:
+            # 这里的打印是为了让用户在终端能直接看到为什么报错，而不是只看 trace
+            print("\n[red]CRITICAL ERROR: No API key found![/red]")
+            print("Please set one of the following environment variables:")
+            print("  - DEEPSEEK_API_KEY")
+            print("  - DASHSCOPE_API_KEY")
+            print("  - OPENAI_API_KEY")
+            print("Or update your config.yaml file separately.\n")
+            raise ValueError("No LLM API key found in environment or config")
 
         self.model = model
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            base_url=base_url,
         )
 
     def generate_outline(self, text_content: str, parent_title: str = "") -> List[OutlineItem]:
@@ -134,7 +154,11 @@ class LLMClient:
                 if is_probably_english(content) and attempt < max_attempts:
                     continue
                 return content
-            except Exception:
+            except Exception as e:
+                # 如果是认证错误，直接抛出，不再重试，因为重试也没用
+                if "401" in str(e) or "auth" in str(e).lower():
+                    raise RuntimeError(f"LLM 认证失败 (401): 请检查您的 API Key 是否正确，并且适用于当前接口 ({self.client.base_url})。报错详情: {e}")
+                
                 if attempt < max_attempts:
                     continue
                 return fallback
@@ -160,13 +184,16 @@ class LLMClient:
         parts = re.split(r"(?=\[Page \d+\])", text_content)
         parts = [p for p in parts if p.strip()]
 
-        if not parts:
-            chunks: List[str] = []
-            text = text_content
-            while text:
-                chunks.append(text[: self.MAX_CHARS_PER_CHUNK])
-                text = text[self.MAX_CHARS_PER_CHUNK :]
-            return chunks
+        # 如果没有找到页面标记，或者由于某种原因 re.split 后还是只有一个超大块，则强制按字符切分
+        if len(parts) <= 1:
+            chunk_source = parts[0] if parts else text_content
+            if len(chunk_source) > self.MAX_CHARS_PER_CHUNK:
+                chunks: List[str] = []
+                text = chunk_source
+                while text:
+                    chunks.append(text[: self.MAX_CHARS_PER_CHUNK])
+                    text = text[self.MAX_CHARS_PER_CHUNK :]
+                return chunks
 
         chunks: List[str] = []
         current = ""
