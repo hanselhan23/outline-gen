@@ -12,7 +12,11 @@ dependencies = [
     "pytesseract>=0.3.10",
     "pillow>=10.0.0",
     "mkdocs>=1.6.1",
+    "mkdocs-material>=9.5.0",
 ]
+
+[tool.setuptools]
+packages = ["outline_gen"]
 
 [project.scripts]
 outline-gen = "outline_gen.cli:main"
